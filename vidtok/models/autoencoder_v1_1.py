@@ -250,15 +250,26 @@ class AutoencodingEngine(AbstractAutoencoder):
 
 
     def build_chunk_start_end(self, t, decoder_mode=False):
-        start_end = [[0, 1]]
-        start = 1
+        if self.is_causal:
+            start_end = [[0, self.temporal_compression_ratio]] if not decoder_mode else [[0, 1]]
+            start = start_end[0][-1]
+        else:
+            start_end, start = [], 0
         end = start
         while True:
             if start >= t:
                 break
-            end = min(t, end + (self.t_chunk_dec if decoder_mode else self.t_chunk_enc))
+            end = min(
+                t, end + (self.num_latent_frames_batch_size if decoder_mode else self.num_sample_frames_batch_size)
+            )
             start_end.append([start, end])
             start = end
+        if len(start_end) > (2 if self.is_causal else 1):
+            if start_end[-1][1] - start_end[-1][0] < (
+                self.num_latent_frames_batch_size if decoder_mode else self.num_sample_frames_batch_size
+            ):
+                start_end[-2] = [start_end[-2][0], start_end[-1][1]]
+                start_end = start_end[:-1]
         return start_end
 
     def enable_tiling(

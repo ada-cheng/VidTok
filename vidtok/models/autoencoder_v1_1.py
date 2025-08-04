@@ -14,6 +14,8 @@ from vidtok.modules.util import (default, get_obj_from_str,
                                  instantiate_from_config, print0)
 from vidtok.modules.regularizers import pack_one, unpack_one, rearrange
 
+from typing import Optional, List
+
 
 class AbstractAutoencoder(pl.LightningModule):
     """
@@ -136,6 +138,21 @@ class AutoencodingEngine(AbstractAutoencoder):
         self.use_overlap = False
         self.is_causal = self.encoder.is_causal
 
+        self.temporal_compression_ratio = 2 ** len(self.encoder.tempo_ds)
+        self.use_slicing = False
+        self.use_tiling = False
+        # Decode more latent frames at once
+        self.num_sample_frames_batch_size = 16
+        self.num_latent_frames_batch_size = self.num_sample_frames_batch_size // self.temporal_compression_ratio
+
+        # We make the minimum height and width of sample for tiling half that of the generally supported
+        self.tile_sample_min_height = 128
+        self.tile_sample_min_width = 128
+        self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** len(self.encoder.spatial_ds)))
+        self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** len(self.encoder.spatial_ds)))
+        self.tile_overlap_factor_height = 0  # 1 / 8
+        self.tile_overlap_factor_width = 0  # 1 / 8
+
         if self.use_ema:
             self.model_ema = LitEma(self, decay=self.ema_decay)
             print0(
@@ -215,6 +232,23 @@ class AutoencodingEngine(AbstractAutoencoder):
                 if hasattr(submodule, 'cache_offset'):
                     submodule.cache_offset = cache_offset
 
+    def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        blend_extent = min(a.shape[3], b.shape[3], blend_extent)
+        for y in range(blend_extent):
+            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (
+                y / blend_extent
+            )
+        return b
+
+    def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        blend_extent = min(a.shape[4], b.shape[4], blend_extent)
+        for x in range(blend_extent):
+            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (
+                x / blend_extent
+            )
+        return b
+
+
     def build_chunk_start_end(self, t, decoder_mode=False):
         start_end = [[0, 1]]
         start = 1
@@ -227,41 +261,119 @@ class AutoencodingEngine(AbstractAutoencoder):
             start = end
         return start_end
 
+    def enable_tiling(
+        self,
+        tile_sample_min_height: Optional[int] = None,
+        tile_sample_min_width: Optional[int] = None,
+        tile_overlap_factor_height: Optional[float] = None,
+        tile_overlap_factor_width: Optional[float] = None,
+    ) -> None:
+        r"""
+        Enable tiled VAE decoding. When this option is enabled, the VAE will split the input tensor into tiles to
+        compute decoding and encoding in several steps. This is useful for saving a large amount of memory and to allow
+        processing larger images.
+        Args:
+            tile_sample_min_height (`int`, *optional*, defaults to `None`):
+                The minimum height required for a sample to be separated into tiles across the height dimension.
+            tile_sample_min_width (`int`, *optional*, defaults to `None`):
+                The minimum width required for a sample to be separated into tiles across the width dimension.
+            tile_overlap_factor_height (`float`, *optional*, defaults to `None`):
+                The minimum amount of overlap between two consecutive vertical tiles. This is to ensure that there are
+                no tiling artifacts produced across the height dimension. Must be between 0 and 1. Setting a higher
+                value might cause more tiles to be processed leading to slow down of the decoding process.
+            tile_overlap_factor_width (`float`, *optional*, defaults to `None`):
+                The minimum amount of overlap between two consecutive horizontal tiles. This is to ensure that there
+                are no tiling artifacts produced across the width dimension. Must be between 0 and 1. Setting a higher
+                value might cause more tiles to be processed leading to slow down of the decoding process.
+        """
+        self.use_tiling = True
+        self.tile_sample_min_height = tile_sample_min_height or self.tile_sample_min_height
+        self.tile_sample_min_width = tile_sample_min_width or self.tile_sample_min_width
+        self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** len(self.encoder.spatial_ds)))
+        self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** len(self.encoder.spatial_ds)))
+        self.tile_overlap_factor_height = tile_overlap_factor_height or self.tile_overlap_factor_height
+        self.tile_overlap_factor_width = tile_overlap_factor_width or self.tile_overlap_factor_width
+
+    def disable_tiling(self) -> None:
+        r"""
+        Disable tiled VAE decoding. If `enable_tiling` was previously enabled, this method will go back to computing
+        decoding in one step.
+        """
+        self.use_tiling = False
+
     def encode(self, x: Any, return_reg_log: bool = False) -> Any:
         self._empty_causal_cached(self.encoder)
         self._set_first_chunk(True)
 
         if self.use_tiling:
-            z, reg_log = self.tile_encode(x)
+            z = self.tiled_encode(x)
         else:
             z = self.encoder(x)
-            z, reg_log = self.regularization(z, n_steps=self.global_step // 2)
+      
+        z, reg_log = self.regularization(z, n_steps=self.global_step // 2)
 
         if return_reg_log:
             return z, reg_log
         return z
 
-    def tile_encode(self, x: Any) -> Any:
-        num_frames = x.shape[2]
-        start_end = self.build_chunk_start_end(num_frames)
-        result_z, result_log = [], []
+    def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
+        r"""
+        Encode a batch of images using a tiled encoder.
+        When this option is enabled, the VAE will split the input tensor into tiles to compute encoding in several
+        steps. This is useful to keep memory use constant regardless of image size. The end result of tiled encoding is
+        different from non-tiled encoding because each tile uses a different encoder. To avoid tiling artifacts, the
+        tiles overlap and are blended together to form a smooth output. You may still see tile-sized changes in the
+        output, but they should be much less noticeable.
+        Args:
+            x (`torch.Tensor`): Input batch of videos.
+        Returns:
+            `torch.Tensor`: The latent representation of the encoded videos.
+        """
+        num_frames, height, width = x.shape[-3:]
 
-        for idx, (start, end) in enumerate(start_end):
-            self._set_first_chunk(idx == 0)
-            chunk = x[:, :, start:end, :, :]
-            chunk_z = self.encoder(chunk)
-            chunk_z, chunk_reg_log = self.regularization(chunk_z, n_steps=self.global_step//2)
-            result_z.append(chunk_z)
-            result_log.append(chunk_reg_log)
-        try:
-            kl_losses = [d['kl_loss'] for d in result_log]
-            mean_kl_loss = torch.mean(torch.stack(kl_losses))
-            return torch.cat(result_z, dim=2), {'kl_loss': mean_kl_loss}
-        except:
-            entropy_aux_losses = [d['aux_loss'] for d in result_log]
-            mean_entropy_aux_loss = torch.mean(torch.stack(entropy_aux_losses))
-            indices = [d['indices'] for d in result_log]
-            return torch.cat(result_z, dim=2), {'aux_loss': mean_entropy_aux_loss, 'indices': torch.cat(indices, dim=1)}
+        overlap_height = int(self.tile_sample_min_height * (1 - self.tile_overlap_factor_height))
+        overlap_width = int(self.tile_sample_min_width * (1 - self.tile_overlap_factor_width))
+        blend_extent_height = int(self.tile_latent_min_height * self.tile_overlap_factor_height)
+        blend_extent_width = int(self.tile_latent_min_width * self.tile_overlap_factor_width)
+        row_limit_height = self.tile_latent_min_height - blend_extent_height
+        row_limit_width = self.tile_latent_min_width - blend_extent_width
+
+        # Split x into overlapping tiles and encode them separately.
+        # The tiles have an overlap to avoid seams between tiles.
+        rows = []
+        for i in range(0, height, overlap_height):
+            row = []
+            for j in range(0, width, overlap_width):
+                start_end = self.build_chunk_start_end(num_frames)
+                time = []
+                for idx, (start_frame, end_frame) in enumerate(start_end):
+                    self._set_first_chunk(idx == 0)
+                    tile = x[
+                        :,
+                        :,
+                        start_frame:end_frame,
+                        i : i + self.tile_sample_min_height,
+                        j : j + self.tile_sample_min_width,
+                    ]
+                    tile = self.encoder(tile)
+                    time.append(tile)
+                row.append(torch.cat(time, dim=2))
+            rows.append(row)
+
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # blend the above tile and the left tile
+                # to the current tile and add the current tile to the result row
+                if i > 0:
+                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent_height)
+                if j > 0:
+                    tile = self.blend_h(row[j - 1], tile, blend_extent_width)
+                result_row.append(tile[:, :, :, :row_limit_height, :row_limit_width])
+            result_rows.append(torch.cat(result_row, dim=4))
+        enc = torch.cat(result_rows, dim=3)
+        return enc
 
     def indices_to_latent(self, token_indices: torch.Tensor) -> torch.Tensor:
         token_indices = rearrange(token_indices, "... -> ... 1")
@@ -294,41 +406,101 @@ class AutoencodingEngine(AbstractAutoencoder):
         self._set_first_chunk(True)
 
         if self.use_tiling:
-            x = self.tile_decode(z)
+            x = self.tiled_decode(z)
         else:
             x = self.decoder(z)
         return x
 
-    def tile_decode(self, z: Any) -> torch.Tensor:
-        num_frames = z.shape[2]
-        start_end = self.build_chunk_start_end(num_frames, decoder_mode=True)
-        result = []
 
-        if self.use_overlap:
-            assert self.encoder.time_downsample_factor in [2, 4, 8], "Only support 2x, 4x or 8x temporal downsampling now."
-            if self.encoder.time_downsample_factor == 4:
-                self._set_cache_offset([self.decoder], 1)
-                self._set_cache_offset([self.decoder.up_temporal[2].upsample, self.decoder.up_temporal[1]], 2)
-                self._set_cache_offset([self.decoder.up_temporal[1].upsample, self.decoder.up_temporal[0], self.decoder.conv_out], 4)
-            elif self.encoder.time_downsample_factor == 2:
-                self._set_cache_offset([self.decoder], 1)
-                self._set_cache_offset([self.decoder.up_temporal[2].upsample, self.decoder.up_temporal[1], self.decoder.up_temporal[0], self.decoder.conv_out], 2)
-            else:
-                self._set_cache_offset([self.decoder], 1)
-                self._set_cache_offset([self.decoder.up_temporal[3].upsample, self.decoder.up_temporal[2]], 2)
-                self._set_cache_offset([self.decoder.up_temporal[2].upsample, self.decoder.up_temporal[1]], 4)
-                self._set_cache_offset([self.decoder.up_temporal[1].upsample, self.decoder.up_temporal[0], self.decoder.conv_out], 8)
+    def tiled_decode(self, z: torch.Tensor) -> torch.Tensor:
+        r"""
+        Decode a batch of images using a tiled decoder.
+        Args:
+            z (`torch.Tensor`): Input batch of latent vectors.
+        Returns:
+            `torch.Tensor`: Reconstructed batch of videos.
+        """
+        num_frames, height, width = z.shape[-3:]
 
-        for idx, (start, end) in enumerate(start_end):
-            self._set_first_chunk(idx == 0)
-            chunk_z = z[:, :, start:end+1, :, :] if self.use_overlap and end + 1 <= num_frames else z[:, :, start:end, :, :]
-            chunk = self.decoder(chunk_z)
+        overlap_height = int(self.tile_latent_min_height * (1 - self.tile_overlap_factor_height))
+        overlap_width = int(self.tile_latent_min_width * (1 - self.tile_overlap_factor_width))
+        blend_extent_height = int(self.tile_sample_min_height * self.tile_overlap_factor_height)
+        blend_extent_width = int(self.tile_sample_min_width * self.tile_overlap_factor_width)
+        row_limit_height = self.tile_sample_min_height - blend_extent_height
+        row_limit_width = self.tile_sample_min_width - blend_extent_width
 
-            if self.use_overlap and end + 1 <= num_frames:
-                chunk = chunk[:, :, :-self.encoder.time_downsample_factor]
-            result.append(chunk.clone())
+        # Split z into overlapping tiles and decode them separately.
+        # The tiles have an overlap to avoid seams between tiles.
+        rows = []
+        for i in range(0, height, overlap_height):
+            row = []
+            for j in range(0, width, overlap_width):
+                if self.is_causal:
+                    assert self.temporal_compression_ratio in [
+                        2,
+                        4,
+                        8,
+                    ], "Only support 2x, 4x or 8x temporal downsampling now."
+                    if self.temporal_compression_ratio == 4:
+                        self._set_cache_offset([self.decoder], 1)
+                        self._set_cache_offset([self.decoder.up_temporal[2].upsample, self.decoder.up_temporal[1]], 2)
+                        self._set_cache_offset(
+                            [self.decoder.up_temporal[1].upsample, self.decoder.up_temporal[0], self.decoder.conv_out],
+                            4,
+                        )
+                    elif self.temporal_compression_ratio == 2:
+                        self._set_cache_offset([self.decoder], 1)
+                        self._set_cache_offset(
+                            [
+                                self.decoder.up_temporal[2].upsample,
+                                self.decoder.up_temporal[1],
+                                self.decoder.up_temporal[0],
+                                self.decoder.conv_out,
+                            ],
+                            2,
+                        )
+                    else:
+                        self._set_cache_offset([self.decoder], 1)
+                        self._set_cache_offset([self.decoder.up_temporal[3].upsample, self.decoder.up_temporal[2]], 2)
+                        self._set_cache_offset([self.decoder.up_temporal[2].upsample, self.decoder.up_temporal[1]], 4)
+                        self._set_cache_offset(
+                            [self.decoder.up_temporal[1].upsample, self.decoder.up_temporal[0], self.decoder.conv_out],
+                            8,
+                        )
 
-        return torch.cat(result, dim=2)
+                start_end = self.build_chunk_start_end(num_frames, decoder_mode=True)
+                time = []
+                for idx, (start_frame, end_frame) in enumerate(start_end):
+                    self._set_first_chunk(idx == 0)
+                    tile = z[
+                        :,
+                        :,
+                        start_frame : (end_frame + 1 if self.is_causal and end_frame + 1 <= num_frames else end_frame),
+                        i : i + self.tile_latent_min_height,
+                        j : j + self.tile_latent_min_width,
+                    ]
+                    tile = self.decoder(tile)
+                    if self.is_causal and end_frame + 1 <= num_frames:
+                        tile = tile[:, :, : -self.temporal_compression_ratio]
+                    time.append(tile)
+                row.append(torch.cat(time, dim=2))
+            rows.append(row)
+
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # blend the above tile and the left tile
+                # to the current tile and add the current tile to the result row
+                if i > 0:
+                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent_height)
+                if j > 0:
+                    tile = self.blend_h(row[j - 1], tile, blend_extent_width)
+                result_row.append(tile[:, :, :, :row_limit_height, :row_limit_width])
+            result_rows.append(torch.cat(result_row, dim=4))
+
+        dec = torch.cat(result_rows, dim=3)
+        return dec
 
     def forward(self, x: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.encoder.fix_encoder:

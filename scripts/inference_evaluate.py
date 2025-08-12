@@ -80,19 +80,19 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/vidtok_kl_causal_488_4chn.yaml",
+        default="configs/vidtok_v1_1/vidtok_kl_causal_488_16chn_v1_1.yaml",
         help="path to config which constructs model",
     )
     parser.add_argument(
         "--ckpt",
         type=str,
-        default="checkpoints/vidtok_kl_causal_488_4chn.ckpt",
+        default="checkpoints/vidtok_kl_causal_488_16chn_v1_1.ckpt",
         help="path to checkpoint of model",
     )
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="./",
+        default="output_mp4s",
         help="root folder",
     )
     parser.add_argument(
@@ -141,14 +141,18 @@ def main():
     model.to(device).eval()
     assert args.chunk_size % model.encoder.time_downsample_factor == 0
     
+    
     if args.read_long_video:
         assert hasattr(model, 'use_tiling'), "Tiling inference is needed to conduct long video reconstruction."
         print(f"Using tiling inference to save memory usage...")
-        model.use_tiling = True
+        model.enable_tiling()
         model.t_chunk_enc = args.chunk_size
         model.t_chunk_dec = model.t_chunk_enc // model.encoder.time_downsample_factor
-        model.use_overlap = True
-
+        
+    if args.input_width > 256:
+        model.enable_tiling()
+    
+ 
     dataset = MultiVideoDataset(
         data_dir=args.data_dir, 
         meta_path=args.meta_path,
@@ -171,7 +175,6 @@ def main():
         for i, input in tqdm(enumerate(dataloader)):
             input = input.to(device)
             _, output, reg_log = model(input)
-
             output = output.clamp(-1, 1)
             input, output = map(lambda x: (x + 1) / 2, (input, output))
 

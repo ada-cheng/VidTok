@@ -137,8 +137,8 @@ class AutoencodingEngine(AbstractAutoencoder):
         self.num_sample_frames_batch_size = 16
         self.num_latent_frames_batch_size = self.num_sample_frames_batch_size // self.temporal_compression_ratio
         # We make the minimum height and width of sample for tiling half that of the generally supported
-        self.tile_sample_min_height = 256
-        self.tile_sample_min_width = 256
+        self.tile_sample_min_height = 128
+        self.tile_sample_min_width = 128
         self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** len(self.encoder.spatial_ds)))
         self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** len(self.encoder.spatial_ds)))
         self.tile_overlap_factor_height = 0  # 1 / 8
@@ -245,7 +245,8 @@ class AutoencodingEngine(AbstractAutoencoder):
 
     def encode(self, x: Any, return_reg_log: bool = False) -> Any:
         if self.use_tiling:
-            z, reg_log = self.tile_encode(x)
+            z = self.tile_encode(x)
+            z, reg_log = self.regularization(z, n_steps=self.global_step // 2)
         else:
             z = self.encoder(x)
             z, reg_log = self.regularization(z, n_steps=self.global_step // 2)
@@ -269,7 +270,7 @@ class AutoencodingEngine(AbstractAutoencoder):
             row = []
             for j in range(0, width, overlap_width):
                 start_end = [[0, num_frames]]
-                result_z, result_log  = [], []
+                result_z  = []
                 for idx, (start_frame, end_frame) in enumerate(start_end):
                    
                     tile = x[
@@ -280,9 +281,8 @@ class AutoencodingEngine(AbstractAutoencoder):
                         j : j + self.tile_sample_min_width,
                     ]
                     tile = self.encoder(tile)
-                    chunk_z, chunk_reg_log = self.regularization(tile, n_steps=self.global_step//2)
-                    result_z.append(chunk_z)
-                    result_log.append(chunk_reg_log)
+                    result_z.append(tile)
+                    
                 row.append(torch.cat(result_z, dim=2))
             rows.append(row)
         
@@ -300,7 +300,7 @@ class AutoencodingEngine(AbstractAutoencoder):
             result_rows.append(torch.cat(result_row, dim=4))
         enc = torch.cat(result_rows, dim=3)
         
-        return enc, {}
+        return enc
     
     def indices_to_latent(self, token_indices: torch.Tensor) -> torch.Tensor:
         token_indices = rearrange(token_indices, "... -> ... 1")

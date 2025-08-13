@@ -287,7 +287,8 @@ class AutoencodingEngine(AbstractAutoencoder):
         self._set_first_chunk(True)
 
         if self.use_tiling:
-            z, reg_log = self.tile_encode(x)
+            z = self.tile_encode(x)
+            z, reg_log = self.regularization(z, n_steps=self.global_step // 2)
         else:
             z = self.encoder(x)
             z, reg_log = self.regularization(z, n_steps=self.global_step // 2)
@@ -307,11 +308,12 @@ class AutoencodingEngine(AbstractAutoencoder):
         row_limit_height = self.tile_latent_min_height - blend_extent_height
         row_limit_width = self.tile_latent_min_width - blend_extent_width
         rows = []
+
         for i in range(0, height, overlap_height):
             row = []
             for j in range(0, width, overlap_width):
                 start_end = self.build_chunk_start_end(num_frames)
-                result_z, result_log  = [], []
+                result_z  = []
                 for idx, (start_frame, end_frame) in enumerate(start_end):
                     self._set_first_chunk(idx == 0)
                     tile = x[
@@ -322,12 +324,9 @@ class AutoencodingEngine(AbstractAutoencoder):
                         j : j + self.tile_sample_min_width,
                     ]
                     tile = self.encoder(tile)
-                    chunk_z, chunk_reg_log = self.regularization(tile, n_steps=self.global_step//2)
-                    result_z.append(chunk_z)
-                    result_log.append(chunk_reg_log)
+                    result_z.append(tile)
                 row.append(torch.cat(result_z, dim=2))
             rows.append(row)
-        
         result_rows = []
         for i, row in enumerate(rows):
             result_row = []
@@ -342,7 +341,7 @@ class AutoencodingEngine(AbstractAutoencoder):
             result_rows.append(torch.cat(result_row, dim=4))
         enc = torch.cat(result_rows, dim=3)
         
-        return enc, {}
+        return enc
         
     def indices_to_latent(self, token_indices: torch.Tensor) -> torch.Tensor:
 

@@ -137,8 +137,8 @@ class AutoencodingEngine(AbstractAutoencoder):
         self.num_sample_frames_batch_size = 16
         self.num_latent_frames_batch_size = self.num_sample_frames_batch_size // self.temporal_compression_ratio
         # We make the minimum height and width of sample for tiling half that of the generally supported
-        self.tile_sample_min_height = 128
-        self.tile_sample_min_width = 128
+        self.tile_sample_min_height = 256
+        self.tile_sample_min_width = 256
         self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** len(self.encoder.spatial_ds)))
         self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** len(self.encoder.spatial_ds)))
         self.tile_overlap_factor_height = 0  # 1 / 8
@@ -344,7 +344,7 @@ class AutoencodingEngine(AbstractAutoencoder):
                     tile = z[
                         :,
                         :,
-                        start_frame : (end_frame + 1 if self.is_causal and end_frame + 1 <= num_frames else end_frame),
+                        start_frame : end_frame,
                         i : i + self.tile_latent_min_height,
                         j : j + self.tile_latent_min_width,
                     ]

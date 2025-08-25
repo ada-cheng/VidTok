@@ -112,6 +112,7 @@ class AutoencodingEngine(AbstractAutoencoder):
         optimizer_config: Union[Dict, None] = None,
         lr_g_factor: float = 1.0,
         compile_model: bool = False,
+        use_tiling: bool = False,
         **kwargs,
     ):
         ckpt_path = kwargs.pop("ckpt_path", None)
@@ -140,14 +141,14 @@ class AutoencodingEngine(AbstractAutoencoder):
 
         self.temporal_compression_ratio = 2 ** len(self.encoder.tempo_ds)
 
-        self.use_tiling = False
+        self.use_tiling = use_tiling
         # Decode more latent frames at once
         self.num_sample_frames_batch_size = 16
         self.num_latent_frames_batch_size = self.num_sample_frames_batch_size // self.temporal_compression_ratio
 
         # We make the minimum height and width of sample for tiling half that of the generally supported
-        self.tile_sample_min_height = 128
-        self.tile_sample_min_width = 128
+        self.tile_sample_min_height = 256
+        self.tile_sample_min_width = 256
         self.tile_latent_min_height = int(self.tile_sample_min_height / (2 ** len(self.encoder.spatial_ds)))
         self.tile_latent_min_width = int(self.tile_sample_min_width / (2 ** len(self.encoder.spatial_ds)))
         self.tile_overlap_factor_height = 0  # 1 / 8

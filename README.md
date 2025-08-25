@@ -63,6 +63,17 @@ if x_recon.shape[2] != x_input.shape[2]:
     x_recon = x_recon[:, :, -x_input.shape[2]:, ...]
 ```
 
+### Enable Spatial Tiling for Large Inputs (>256)
+
+We further evaluated different models in terms of memory usage and inference time with spatial tiling, using an input size of 17 × 768 × 768.
+
+
+| Model                     | Regularizer | Memory Allocated | Average Inference Time |
+|----------------------------|-------------|------------------|-------------------------|
+| vidtok_fsq_causal_488_4096 | FSQ-4096    | 6.66 GB        | 10.44 s                 |
+| vidtok_kl_causal_488_4chn | KL-4chn    | 6.65 GB        | 10.42 s                 |
+
+
 ### v1.1: Long Video Fine-tuning
 Follow this [training guidance](#fine-tune-on-custom-data) to fine-tune on your custom long video data and note that:
 - Compared to VidTok v1.0, we tend to use longer sequences to fine-tune the model (for example, setting `NUM_FRAMES_1` to 33, 49, or larger). 
